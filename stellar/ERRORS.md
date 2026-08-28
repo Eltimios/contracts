@@ -211,3 +211,4 @@ These enums are compiled only for tests or live under test fixtures. They are in
 | 1 | [`MockTokenError::InsufficientBalance`](stealth-sender/src/test_mocks.rs#L26) | Mock token transfer balance is too low. | pre-catalog |
 | 2 | [`MockTokenError::InsufficientAllowance`](stealth-sender/src/test_mocks.rs#L27) | Mock token allowance is too low. | pre-catalog |
 | 11 | [`TokenError::BalanceDeauthorized`](stealth-sender/tests/mocks/token_auth_required.rs#L12) | Test token recipient is not authorized to receive balance. | pre-catalog |
+<!-- ci-retrigger: validate error catalog after ERRORS.md's addition to this branch -->
