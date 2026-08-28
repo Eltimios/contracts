@@ -16,14 +16,18 @@
 mod harness;
 
 use harness::ChaosClient;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{Address, Bytes, BytesN, Env, String as SorobanString};
 
+use governance::{GovernanceContract, GovernanceContractClient};
 use stealth_announcer::{
     StealthAnnouncerContract, StealthAnnouncerContractClient, STELLAR_V2_SCHEME_ID,
 };
+use stealth_batch_sender::{StealthBatchSender, StealthBatchSenderClient, Transfer};
 use stealth_registry::{StealthRegistryContract, StealthRegistryContractClient};
 use stealth_sender::{StealthSenderContract, StealthSenderContractClient};
+use stealth_splitter::{Beneficiary, StealthSplitterContract, StealthSplitterContractClient};
+use stealth_vault::{StealthVaultContract, StealthVaultContractClient};
 use wraith_names::{WraithNamesContract, WraithNamesContractClient};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -60,6 +64,30 @@ mod mock_announcer {
         ) {
             env.events()
                 .publish((symbol_short!("announce"), stealth_address), ());
+        }
+    }
+}
+
+/// Minimal target mock for governance execution tests.
+mod mock_gov_target {
+    use soroban_sdk::{contract, contractimpl, symbol_short, Bytes, Env};
+
+    #[contract]
+    pub struct MockGovTarget;
+
+    #[contractimpl]
+    impl MockGovTarget {
+        pub fn set_value(env: Env, value: Bytes) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("value"), &value);
+        }
+
+        pub fn get_value(env: Env) -> Bytes {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("value"))
+                .unwrap_or(Bytes::new(&env))
         }
     }
 }
@@ -464,4 +492,332 @@ fn chaos_different_seeds_differ() {
         r2.push(c2.execute("t", || Ok::<_, ()>(1)).is_ok());
     }
     assert_ne!(r1, r2, "different seeds should produce different sequences");
+}
+
+// ── Vault tests ──────────────────────────────────────────────────────────────
+
+/// ChaosClient wrappers for stealth-vault entrypoints.
+///
+/// # Retry / bail policy (per entrypoint)
+///
+/// | Entrypoint | Http500 | Timeout | WrongLedger | EmptyResponse |
+/// |---|---|---|---|---|
+/// | `vault.deposit` | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+/// | `vault.claim`   | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+/// | `vault.refund`  | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+///
+/// All three entrypoints share the standard policy defined in `ChaosClient::execute`.
+/// `deposit` is the only entrypoint blocked by pause; `claim` and `refund` remain
+/// callable even when the contract is paused so recipients can always exit.
+
+#[test]
+fn vault_deposit_and_claim_through_chaos() {
+    let chaos = ChaosClient::from_env();
+    let result = chaos.execute("vault.deposit+claim", || {
+        let env = env();
+        env.mock_all_auths();
+
+        // Deploy a mock announcer that vault can cross-call.
+        let announcer_id = env.register(mock_announcer::MockAnnouncer, ());
+
+        let vault_id = env.register(StealthVaultContract, ());
+        let vault = StealthVaultContractClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        vault.init(&admin, &announcer_id);
+
+        // Mint tokens to sender.
+        let (token, sender) = funded_token(&env);
+
+        let recipient = Address::generate(&env);
+        let epk = bytes32(&env, &[0xcc; 32]);
+
+        // deposit: unlock at ledger 10, refund after 2010 (> 10 + DEFAULT_GRACE_PERIOD 1000)
+        let deposit_id = vault.deposit(&sender, &recipient, &500, &token, &10u32, &2010u32, &epk);
+
+        // Advance ledger past unlock.
+        env.ledger().with_mut(|li| li.sequence_number = 10);
+
+        // claim
+        vault.claim(&deposit_id, &recipient);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 500);
+
+        Ok::<_, harness::ChaosError>(())
+    });
+
+    if chaos.is_chaos_enabled() {
+        assert!(result.is_err());
+    } else {
+        assert!(result.is_ok());
+    }
+}
+
+#[test]
+fn vault_deposit_and_refund_through_chaos() {
+    let chaos = ChaosClient::from_env();
+    let result = chaos.execute("vault.deposit+refund", || {
+        let env = env();
+        env.mock_all_auths();
+
+        let announcer_id = env.register(mock_announcer::MockAnnouncer, ());
+        let vault_id = env.register(StealthVaultContract, ());
+        let vault = StealthVaultContractClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        vault.init(&admin, &announcer_id);
+
+        let (token, sender) = funded_token(&env);
+        let recipient = Address::generate(&env);
+        let epk = bytes32(&env, &[0xdd; 32]);
+
+        let deposit_id = vault.deposit(&sender, &recipient, &300, &token, &10u32, &2010u32, &epk);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let balance_after_deposit = token_client.balance(&sender);
+
+        // Advance ledger past refund_after.
+        env.ledger().with_mut(|li| li.sequence_number = 2010);
+
+        vault.refund(&deposit_id);
+
+        assert_eq!(token_client.balance(&sender), balance_after_deposit + 300);
+
+        Ok::<_, harness::ChaosError>(())
+    });
+
+    if chaos.is_chaos_enabled() {
+        assert!(result.is_err());
+    } else {
+        assert!(result.is_ok());
+    }
+}
+
+// ── Splitter tests ───────────────────────────────────────────────────────────
+
+/// ChaosClient wrappers for stealth-splitter entrypoints.
+///
+/// # Retry / bail policy (per entrypoint)
+///
+/// | Entrypoint | Http500 | Timeout | WrongLedger | EmptyResponse |
+/// |---|---|---|---|---|
+/// | `splitter.create_split` | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+/// | `splitter.fund_split`   | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+///
+/// `create_split` is idempotent on the same inputs (same split_id returned for same
+/// beneficiaries + salt), so Http500 retries are safe. `fund_split` is NOT idempotent;
+/// callers must guard against duplicate funding on retry by checking `get_split`
+/// `total_funded` before re-submitting.
+
+#[test]
+fn splitter_create_and_fund_through_chaos() {
+    let chaos = ChaosClient::from_env();
+    let result = chaos.execute("splitter.create+fund", || {
+        let env = env();
+        env.mock_all_auths();
+
+        let announcer_id = env.register(mock_announcer::MockAnnouncer, ());
+        let splitter_id = env.register(StealthSplitterContract, ());
+        let splitter = StealthSplitterContractClient::new(&env, &splitter_id);
+
+        splitter.init(&announcer_id);
+
+        let creator = Address::generate(&env);
+        let (token, funder) = funded_token(&env);
+
+        // Build two beneficiaries with 64-byte meta-addresses.
+        let mut beneficiaries = soroban_sdk::vec![&env];
+        beneficiaries.push_back(Beneficiary {
+            meta_address: bytes(&env, &[0x11u8; 64]),
+            weight: 1,
+        });
+        beneficiaries.push_back(Beneficiary {
+            meta_address: bytes(&env, &[0x22u8; 64]),
+            weight: 1,
+        });
+
+        let salt = bytes(&env, b"chaos-salt");
+        let split_id = splitter.create_split(&creator, &beneficiaries, &token, &salt);
+
+        // Prepare per-beneficiary stealth addresses and ephemeral keys.
+        let stealth1 = Address::generate(&env);
+        let stealth2 = Address::generate(&env);
+        let stealth_addrs = soroban_sdk::vec![&env, stealth1.clone(), stealth2.clone()];
+        let epks = soroban_sdk::vec![
+            &env,
+            bytes32(&env, &[0x01u8; 32]),
+            bytes32(&env, &[0x02u8; 32])
+        ];
+        let metadatas = soroban_sdk::vec![&env, bytes(&env, &[0x01]), bytes(&env, &[0x02])];
+
+        splitter.fund_split(
+            &funder,
+            &split_id,
+            &1000,
+            &1u32,
+            &stealth_addrs,
+            &epks,
+            &metadatas,
+        );
+
+        let details = splitter.get_split(&split_id);
+        assert_eq!(details.total_funded, 1000);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        // Splitter distributes to each beneficiary: first absorbs dust (amount - already_distributed),
+        // subsequent beneficiaries get proportional shares. With 2 equal-weight beneficiaries:
+        // i=0 (dust): 1000 - 0 = 1000; i=1: 1000 * 1/2 = 500. Both addresses receive tokens.
+        assert!(token_client.balance(&stealth1) > 0);
+        assert!(token_client.balance(&stealth2) > 0);
+
+        Ok::<_, harness::ChaosError>(())
+    });
+
+    if chaos.is_chaos_enabled() {
+        assert!(result.is_err());
+    } else {
+        assert!(result.is_ok());
+    }
+}
+
+// ── Batch-sender tests ───────────────────────────────────────────────────────
+
+/// ChaosClient wrappers for stealth-batch-sender entrypoints.
+///
+/// # Retry / bail policy (per entrypoint)
+///
+/// | Entrypoint | Http500 | Timeout | WrongLedger | EmptyResponse |
+/// |---|---|---|---|---|
+/// | `batch_sender.batch_send` | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+///
+/// `batch_send` has all-or-nothing semantics at the Soroban transaction level.
+/// A WrongLedger bail is final — the caller must re-build the batch and resubmit
+/// after confirming the current ledger state. An Http500 or Timeout retry is safe
+/// only if the transaction was not yet included; callers should check recipient
+/// balances before retrying to avoid double-sends.
+
+#[test]
+fn batch_sender_batch_send_through_chaos() {
+    let chaos = ChaosClient::from_env();
+    let result = chaos.execute("batch_sender.batch_send", || {
+        let env = env();
+        env.mock_all_auths();
+
+        let batch_sender_id = env.register(StealthBatchSender, ());
+        let client = StealthBatchSenderClient::new(&env, &batch_sender_id);
+
+        let (token, from) = funded_token(&env);
+
+        let stealth1 = Address::generate(&env);
+        let stealth2 = Address::generate(&env);
+        let stealth3 = Address::generate(&env);
+
+        let mut transfers = soroban_sdk::vec![&env];
+        transfers.push_back(Transfer {
+            stealth_address: stealth1.clone(),
+            ephemeral_pub_key: bytes(&env, &[0x01u8; 32]),
+            amount: 100,
+        });
+        transfers.push_back(Transfer {
+            stealth_address: stealth2.clone(),
+            ephemeral_pub_key: bytes(&env, &[0x02u8; 32]),
+            amount: 200,
+        });
+        transfers.push_back(Transfer {
+            stealth_address: stealth3.clone(),
+            ephemeral_pub_key: bytes(&env, &[0x03u8; 32]),
+            amount: 300,
+        });
+
+        client.batch_send(&from, &transfers, &token);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&stealth1), 100);
+        assert_eq!(token_client.balance(&stealth2), 200);
+        assert_eq!(token_client.balance(&stealth3), 300);
+
+        Ok::<_, harness::ChaosError>(())
+    });
+
+    if chaos.is_chaos_enabled() {
+        assert!(result.is_err());
+    } else {
+        assert!(result.is_ok());
+    }
+}
+
+// ── Governance tests ─────────────────────────────────────────────────────────
+
+/// ChaosClient wrappers for governance entrypoints.
+///
+/// # Retry / bail policy (per entrypoint)
+///
+/// | Entrypoint | Http500 | Timeout | WrongLedger | EmptyResponse |
+/// |---|---|---|---|---|
+/// | `governance.propose` | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+/// | `governance.vote`    | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+/// | `governance.execute` | retry ×3, bail `MaxRetriesExceeded` | retry ×1, bail `MaxRetriesExceeded` | no retry, bail `WrongLedger` | retry ×1, bail `EmptyResponse` |
+///
+/// `propose` is not idempotent: each retry creates a new proposal.  Callers should
+/// query `get_proposal` before retrying to confirm the first attempt did not land.
+/// `vote` is idempotent for a given (proposal_id, voter) pair; the contract rejects
+/// duplicate votes with `AlreadyVoted`, so Http500 retries are safe.
+/// `execute` is idempotent; the contract rejects re-execution with `AlreadyExecuted`.
+
+#[test]
+fn governance_propose_vote_execute_through_chaos() {
+    let chaos = ChaosClient::from_env();
+    let result = chaos.execute("governance.propose+vote+execute", || {
+        let env = env();
+        env.mock_all_auths();
+
+        // Deploy governance and dependencies.
+        let gov_id = env.register(GovernanceContract, ());
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+
+        let target_id = env.register(mock_gov_target::MockGovTarget, ());
+
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+
+        // quorum=100, voting_period=50, timelock=10
+        gov.init(&admin, &token_id, &100i128, &50u32, &10u32);
+
+        // Mint voting power.
+        let voter = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&voter, &200);
+
+        let proposer = Address::generate(&env);
+        let function = soroban_sdk::symbol_short!("set_value");
+        let args = bytes(&env, b"chaos-gov");
+        let description = soroban_sdk::String::from_str(&env, "chaos governance proposal");
+
+        let pid = gov.propose(&proposer, &target_id, &function, &args, &description);
+
+        gov.vote(&voter, &pid, &true);
+
+        let proposal = gov.get_proposal(&pid);
+
+        // Advance past end_ledger + timelock.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = proposal.end_ledger + 20;
+        });
+
+        gov.execute(&pid);
+
+        let p2 = gov.get_proposal(&pid);
+        assert!(p2.executed);
+
+        Ok::<_, harness::ChaosError>(())
+    });
+
+    if chaos.is_chaos_enabled() {
+        assert!(result.is_err());
+    } else {
+        assert!(result.is_ok());
+    }
 }
